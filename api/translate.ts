@@ -1,7 +1,7 @@
 // api/translate.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const MYMEMORY_API = 'https://api.mymemory.translated.net/get';
 
 export default async function handler(
   request: VercelRequest,
@@ -16,73 +16,33 @@ export default async function handler(
     return response.status(200).end();
   }
 
-  const { title, summary, apiKey } = request.body;
+  const { title, summary } = request.body;
 
   if (!title) {
     return response.status(400).json({ error: 'Missing title parameter' });
   }
 
-  // Get API key from env - check both VITE_ and plain versions
-  const key = apiKey || process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY;
-  
-  console.log('[Translate] API Key present:', !!key);
-  
-  if (!key) {
-    console.error('[Translate] No API key found');
-    return response.status(400).json({ error: 'No API key configured' });
-  }
-
   try {
-    // Build translation prompt
-    const prompt = summary
-      ? `Translate the following news title and summary to Chinese (Simplified). Keep it natural and concise.\n\nTitle: ${title}\n\nSummary: ${summary}`
-      : `Translate the following news title to Chinese (Simplified). Keep it natural and concise.\n\nTitle: ${title}`;
+    // Translate title
+    const titleUrl = `${MYMEMORY_API}?q=${encodeURIComponent(title)}&langpair=en|zh-CN`;
+    const titleRes = await fetch(titleUrl);
+    const titleData = await titleRes.json();
 
-    const res = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a professional translator. Translate to Chinese (Simplified) only, no explanations.',
-          },
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
-        temperature: 0.3,
-        max_tokens: 512,
-      }),
-    });
-
-    if (!res.ok) {
-      const error = await res.text();
-      console.error('Groq API error:', error);
-      return response.status(502).json({ error: 'Translation API error' });
+    if (titleData.responseStatus !== 200) {
+      throw new Error(titleData.responseDetails || 'Translation failed');
     }
 
-    const data = await res.json();
-    const translated = data.choices?.[0]?.message?.content?.trim();
+    const translatedTitle = titleData.responseData.translatedText;
 
-    if (!translated) {
-      return response.status(500).json({ error: 'No translation returned' });
-    }
-
-    // Parse result
-    let translatedTitle = translated;
+    // Translate summary if present
     let translatedSummary: string | undefined;
-
     if (summary) {
-      const parts = translated.split('\n\n');
-      if (parts.length >= 2) {
-        translatedTitle = parts[0].replace(/^Title:\s*/i, '').trim();
-        translatedSummary = parts[1].replace(/^Summary:\s*/i, '').trim();
+      const summaryUrl = `${MYMEMORY_API}?q=${encodeURIComponent(summary)}&langpair=en|zh-CN`;
+      const summaryRes = await fetch(summaryUrl);
+      const summaryData = await summaryRes.json();
+      
+      if (summaryData.responseStatus === 200) {
+        translatedSummary = summaryData.responseData.translatedText;
       }
     }
 
