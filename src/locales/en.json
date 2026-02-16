@@ -219,5 +219,16 @@
   "intelligenceGapBadge": {
     "title": "Intelligence findings",
     "more": "more findings"
+  },
+  "newsPanel": {
+    "summarizeTitle": "Generate Summary",
+    "generating": "Generating...",
+    "couldNotGenerate": "Could not generate summary",
+    "summaryFailed": "Summary generation failed",
+    "translating": "Translating...",
+    "alsoReported": "Also reported",
+    "translate": "Translate",
+    "showOriginal": "Original",
+    "showChinese": "Chinese"
   }
 }
