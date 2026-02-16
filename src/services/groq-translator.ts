@@ -19,6 +19,7 @@ interface TranslationItem {
 
 const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const TRANSLATE_API_URL = '/api/translate';
 
 // In-memory cache (persisted to localStorage separately)
 const translationCache: TranslationCache = {};
@@ -38,6 +39,30 @@ export function getCacheKey(newsId: string): string {
   return `trans_${newsId}`;
 }
 
+/**
+ * Translate via local API proxy (to avoid CORS issues)
+ */
+async function translateViaProxy(title: string, summary?: string, apiKey?: string): Promise<{ title: string; summary?: string }> {
+  try {
+    const res = await fetch(TRANSLATE_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ title, summary, apiKey }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Translation API error: ${res.status}`);
+    }
+
+    return await res.json();
+  } catch (error) {
+    console.error('[Translator] Proxy translation failed:', error);
+    throw error;
+  }
+}
+
 export async function translateNews(
   title: string,
   summary?: string,
@@ -55,7 +80,23 @@ export async function translateNews(
     };
   }
 
-  // Get API key from env, parameter, or localStorage (for user-provided keys)
+  // Try local proxy first (for Vercel deployment)
+  try {
+    const result = await translateViaProxy(title, summary, apiKey);
+    
+    // Cache in memory
+    translationCache[cacheKey] = {
+      translatedTitle: result.title,
+      translatedSummary: result.summary,
+      timestamp: Date.now(),
+    };
+
+    return result;
+  } catch (proxyError) {
+    console.warn('[Translator] Proxy failed, trying direct:', proxyError);
+  }
+
+  // Fallback: direct API call (for local development)
   const key = apiKey || import.meta.env.VITE_GROQ_API_KEY || localStorage.getItem('groq-api-key');
   if (!key) {
     console.warn('[Translator] No Groq API key configured');
@@ -204,7 +245,7 @@ export function cacheTranslation(newsId: string, title: string, summary?: string
 
 /**
  * Batch translate multiple news items
- * Uses a single API call with multiple prompts
+ * Uses proxy API to avoid CORS issues
  */
 export async function translateBatch(
   items: TranslationItem[],
@@ -225,126 +266,31 @@ export async function translateBatch(
     }));
   }
 
-  const key = apiKey || import.meta.env.VITE_GROQ_API_KEY || localStorage.getItem('groq-api-key');
-  if (!key) {
-    console.warn('[Translator] No Groq API key configured');
-    return items.map(item => ({
-      id: item.id,
-      title: item.title,
-      summary: item.summary,
-    }));
+  // Translate each item through the proxy
+  const results: Array<{ id: string; title: string; summary?: string }> = [];
+  
+  for (const item of pendingItems) {
+    try {
+      const result = await translateViaProxy(item.title, item.summary, apiKey);
+      cacheTranslation(item.id, result.title, result.summary);
+      results.push({ id: item.id, ...result });
+    } catch (error) {
+      console.warn(`[Translator] Failed to translate item ${item.id}:`, error);
+      results.push({ id: item.id, title: item.title, summary: item.summary });
+    }
   }
 
-  try {
-    // Build batch prompt
-    const promptParts = pendingItems.map((item, index) => {
-      const num = index + 1;
-      if (item.summary) {
-        return `${num}. Title: ${item.title}\nSummary: ${item.summary}`;
-      }
-      return `${num}. Title: ${item.title}`;
-    });
-
-    const prompt = `Translate the following ${pendingItems.length} news items to Chinese (Simplified). Keep translations natural and concise. Format your response as shown - each item on its own line with "Title:" and "Summary:" prefixes:\n\n${promptParts.join('\n\n')}`;
-
-    const response = await fetch(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a professional translator. Translate to Chinese (Simplified) only, no explanations. Keep the same format: "Title: ...\nSummary: ..." for each item.',
-          },
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
-        temperature: 0.3,
-        max_tokens: 2048,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Groq API error: ${response.status}`);
+  // Merge with original items (preserve order)
+  return items.map(item => {
+    const translatedItem = results.find(r => r.id === item.id);
+    if (translatedItem) {
+      return translatedItem;
     }
-
-    const data = await response.json();
-    const translated = data.choices?.[0]?.message?.content?.trim();
-
-    if (!translated) {
-      throw new Error('No translation returned');
+    // If not translated, check cache
+    const cached = getCachedTranslation(item.id);
+    if (cached) {
+      return { id: item.id, ...cached };
     }
-
-    // Parse results
-    const results: Array<{ id: string; title: string; summary?: string }> = [];
-    const lines = translated.split('\n');
-    let currentItem: { title: string; summary?: string } | null = null;
-    let currentId = '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      // Check for numbered item (e.g., "1.", "2.")
-      const numMatch = trimmed.match(/^(\d+)\.\s*/);
-      if (numMatch) {
-        // Save previous item
-        if (currentItem && currentId) {
-          results.push({ id: currentId, ...currentItem });
-          cacheTranslation(currentId, currentItem.title, currentItem.summary);
-        }
-        // Start new item
-        const index = parseInt(numMatch[1]) - 1;
-        currentId = pendingItems[index]?.id || '';
-        currentItem = null;
-        continue;
-      }
-
-      // Parse Title or Summary
-      if (trimmed.toLowerCase().startsWith('title:')) {
-        currentItem = {
-          title: trimmed.replace(/^title:\s*/i, '').trim(),
-        };
-      } else if (trimmed.toLowerCase().startsWith('summary:')) {
-        if (currentItem) {
-          currentItem.summary = trimmed.replace(/^summary:\s*/i, '').trim();
-        }
-      }
-    }
-
-    // Save last item
-    if (currentItem && currentId) {
-      results.push({ id: currentId, ...currentItem });
-      cacheTranslation(currentId, currentItem.title, currentItem.summary);
-    }
-
-    // Merge with original items (preserve order)
-    return items.map(item => {
-      const translatedItem = results.find(r => r.id === item.id);
-      if (translatedItem) {
-        return translatedItem;
-      }
-      // If not translated, check cache
-      const cached = getCachedTranslation(item.id);
-      if (cached) {
-        return { id: item.id, ...cached };
-      }
-      return { id: item.id, title: item.title, summary: item.summary };
-    });
-
-  } catch (error) {
-    console.error('[Translator] Batch translation failed:', error);
-    // Fallback to original
-    return items.map(item => ({
-      id: item.id,
-      title: item.title,
-      summary: item.summary,
-    }));
-  }
+    return { id: item.id, title: item.title, summary: item.summary };
+  });
 }
