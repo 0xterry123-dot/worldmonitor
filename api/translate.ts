@@ -22,10 +22,13 @@ export default async function handler(
     return response.status(400).json({ error: 'Missing title parameter' });
   }
 
-  // Get API key from env or request body
+  // Get API key from env - check both VITE_ and plain versions
   const key = apiKey || process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY;
   
+  console.log('[Translate] API Key present:', !!key);
+  
   if (!key) {
+    console.error('[Translate] No API key found');
     return response.status(400).json({ error: 'No API key configured' });
   }
 
